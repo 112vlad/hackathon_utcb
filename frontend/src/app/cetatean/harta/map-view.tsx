@@ -2,11 +2,29 @@
 
 import { useMemo, useEffect, useRef } from "react";
 import { MapContainer, TileLayer, CircleMarker, Popup, Polyline, GeoJSON, Marker, Tooltip, useMap, Circle } from "react-leaflet";
-import type { Report, Proposal, Project, MapLayer, TransitStop, TransitShapeCollection, BikeRouteResult, SafeSpot } from "@/types";
+import type { Report, Proposal, Project, MapLayer, TransitStop, TransitShapeCollection } from "@/types";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 
 type LatLng = { lat: number; lng: number };
+
+type NetworkType = "principala" | "secundara";
+
+interface NetworkPolyline {
+  coords: LatLng[];
+  type: NetworkType;
+}
+
+interface LocalRouteResult {
+  found: boolean;
+  totalDistanceKm: number;
+  totalTimeMin: number;
+  bikeKm: number;
+  bikePercent: number;
+  accessRoute: LatLng[];
+  bikeRoute: LatLng[];
+  egressRoute: LatLng[];
+}
 
 interface MapViewProps {
   reports: Report[];
@@ -17,7 +35,8 @@ interface MapViewProps {
   infrastructureElements?: any[];
   layers: MapLayer[];
   onReportClick: (id: string) => void;
-  bikeRoute?: BikeRouteResult | null;
+  localRoute?: LocalRouteResult | null;
+  networkPolylines?: NetworkPolyline[];
   routePickerMode?: "start" | "end" | null;
   onMapClick?: (lat: number, lng: number) => void;
   routeStart?: { lat: number; lng: number } | null;
@@ -33,7 +52,6 @@ const severityColors: Record<string, string> = {
   critic: "#ef4444",
 };
 
-// Small icon factory for transit stops
 function transitIcon() {
   return L.divIcon({
     className: "",
@@ -61,16 +79,6 @@ function endIcon() {
   });
 }
 
-function safeSpotIcon() {
-  return L.divIcon({
-    className: "",
-    html: `<div style="width:14px;height:14px;border-radius:50%;background:#fbbf24;border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.4)"></div>`,
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
-  });
-}
-
-// Map click handler component
 function MapClickHandler({ onClick }: { onClick?: (lat: number, lng: number) => void }) {
   const map = useMap();
   useEffect(() => {
@@ -82,7 +90,6 @@ function MapClickHandler({ onClick }: { onClick?: (lat: number, lng: number) => 
   return null;
 }
 
-// Navigation mode: follow user position and tilt
 function NavigationFollower({ position, active }: { position: LatLng | null; active: boolean }) {
   const map = useMap();
   const firstFollow = useRef(true);
@@ -104,30 +111,37 @@ function NavigationFollower({ position, active }: { position: LatLng | null; act
   return null;
 }
 
-// Fit map to route bounds when route changes
-function FitRouteBounds({ route }: { route: BikeRouteResult | null | undefined }) {
+function FitLocalRouteBounds({ route }: { route: LocalRouteResult | null | undefined }) {
   const map = useMap();
   const fitted = useRef<string | null>(null);
+
   useEffect(() => {
-    if (!route?.found || !route.segments.length) return;
-    const key = route.segments.map(s => s.name).join("|");
+    if (!route?.found) return;
+    
+    const allCoords: [number, number][] = [];
+    for (const pt of route.accessRoute) {
+      allCoords.push([pt.lat, pt.lng]);
+    }
+    for (const pt of route.bikeRoute) {
+      allCoords.push([pt.lat, pt.lng]);
+    }
+    for (const pt of route.egressRoute) {
+      allCoords.push([pt.lat, pt.lng]);
+    }
+
+    if (allCoords.length === 0) return;
+
+    const key = allCoords.map(c => `${c[0].toFixed(4)},${c[1].toFixed(4)}`).join("|").slice(0, 100);
     if (fitted.current === key) return;
     fitted.current = key;
-    const allCoords: [number, number][] = [];
-    for (const seg of route.segments) {
-      for (const [lng, lat] of seg.coordinates) {
-        allCoords.push([lat, lng]);
-      }
-    }
-    if (allCoords.length > 0) {
-      const bounds = L.latLngBounds(allCoords);
-      map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 });
-    }
+
+    const bounds = L.latLngBounds(allCoords);
+    map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 });
   }, [map, route]);
+
   return null;
 }
 
-// Haversine distance for heatmap proximity
 function haversineM(a: LatLng, b: LatLng): number {
   const R = 6371000;
   const dLat = ((b.lat - a.lat) * Math.PI) / 180;
@@ -136,7 +150,6 @@ function haversineM(a: LatLng, b: LatLng): number {
   return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 
-// User position icon (blue dot with pulse)
 function userPositionIcon() {
   return L.divIcon({
     className: "",
@@ -150,18 +163,6 @@ function userPositionIcon() {
   });
 }
 
-// Route segment color based on road type — BOLD & VIVID
-function routeSegmentColor(roadType: string): string {
-  switch (roadType) {
-    case "bike_lane": return "#10b981";    // bright emerald – safe
-    case "pedestrian": return "#4ade80";   // vivid green
-    case "shared": return "#f59e0b";       // strong amber – moderate
-    case "car_only": return "#f43f5e";     // vivid rose – dangerous
-    default: return "#cbd5e1";
-  }
-}
-
-// Infrastructure element type → color
 const infraColors: Record<string, string> = {
   bike_lane: "#a3e635",
   bike_parking: "#22d3ee",
@@ -178,7 +179,8 @@ export default function MapView({
   infrastructureElements = [],
   layers,
   onReportClick,
-  bikeRoute,
+  localRoute,
+  networkPolylines = [],
   routePickerMode,
   onMapClick,
   routeStart,
@@ -188,7 +190,6 @@ export default function MapView({
 }: MapViewProps) {
   const isVisible = (id: string) => layers.find((l) => l.id === id)?.visible ?? false;
 
-  // Group infrastructure elements by type for rendering
   const infraPolylines = useMemo(() => {
     return infrastructureElements.filter((e) => e.geometry?.type === "LineString");
   }, [infrastructureElements]);
@@ -208,6 +209,23 @@ export default function MapView({
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
+
+      {/* Network polylines: bike lanes from GeoJSON */}
+      {isVisible("infrastructura") && networkPolylines.map((line, idx) => (
+        <Polyline
+          key={`network-${idx}`}
+          positions={line.coords.map((c) => [c.lat, c.lng]) as [number, number][]}
+          pathOptions={{
+            color: line.type === "principala" ? "#22c55e" : "#3b82f6",
+            weight: line.type === "principala" ? 5 : 4,
+            opacity: 0.8,
+          }}
+        >
+          <Tooltip sticky>
+            {line.type === "principala" ? "Pistă principală" : "Pistă secundară"}
+          </Tooltip>
+        </Polyline>
+      ))}
 
       {/* Layer: Heatmap pericole - reports */}
       {isVisible("heatmap_pericole") &&
@@ -238,7 +256,7 @@ export default function MapView({
           </CircleMarker>
         ))}
 
-      {/* Layer: Infrastructură - polylines (bike lanes) — BOLD */}
+      {/* Layer: Infrastructură - polylines (from DB) */}
       {isVisible("infrastructura") &&
         infraPolylines.map((el) => {
           const coords: [number, number][] = el.geometry.coordinates.map(
@@ -297,7 +315,6 @@ export default function MapView({
               </Polyline>
             );
           }
-          // Fallback: show as point
           return (
             <CircleMarker
               key={proj.id}
@@ -378,48 +395,55 @@ export default function MapView({
         </Marker>
       )}
 
-      {/* Route planner: route segments color-coded by safety — EXTRA BOLD */}
-      {bikeRoute?.found && bikeRoute.segments.map((seg, idx) => {
-        if (!seg.coordinates || seg.coordinates.length < 2) return null;
-        const positions: [number, number][] = seg.coordinates.map(
-          ([lng, lat]) => [lat, lng] as [number, number]
-        );
-        return (
-          <Polyline
-            key={`route-seg-${idx}`}
-            positions={positions}
-            pathOptions={{
-              color: routeSegmentColor(seg.roadType),
-              weight: 8,
-              opacity: 1,
-            }}
-          >
-            <Tooltip sticky>
-              {seg.name} — {seg.roadType === "bike_lane" ? "Pistă ciclabilă" :
-                seg.roadType === "shared" ? "Bandă partajată" :
-                seg.roadType === "pedestrian" ? "Zonă pietonală" :
-                "Drum auto"} (siguranță: {seg.safetyScore}%)
-            </Tooltip>
-          </Polyline>
-        );
-      })}
-
-      {/* Route planner: safe spot markers */}
-      {bikeRoute?.found && bikeRoute.safeSpots.map((spot, idx) => (
-        <Marker
-          key={`safe-${idx}`}
-          position={[spot.lat, spot.lng]}
-          icon={safeSpotIcon()}
+      {/* Local route: access route (street, dashed gray) */}
+      {localRoute?.found && localRoute.accessRoute.length > 1 && (
+        <Polyline
+          positions={localRoute.accessRoute.map((pt) => [pt.lat, pt.lng]) as [number, number][]}
+          pathOptions={{
+            color: "#9ca3af",
+            weight: 5,
+            opacity: 0.9,
+            dashArray: "8 6",
+          }}
         >
-          <Tooltip>{spot.name}</Tooltip>
-        </Marker>
-      ))}
+          <Tooltip sticky>Acces pe stradă</Tooltip>
+        </Polyline>
+      )}
+
+      {/* Local route: bike route (yellow, solid) */}
+      {localRoute?.found && localRoute.bikeRoute.length > 1 && (
+        <Polyline
+          positions={localRoute.bikeRoute.map((pt) => [pt.lat, pt.lng]) as [number, number][]}
+          pathOptions={{
+            color: "#eab308",
+            weight: 7,
+            opacity: 1,
+          }}
+        >
+          <Tooltip sticky>Pe pistă ciclabilă</Tooltip>
+        </Polyline>
+      )}
+
+      {/* Local route: egress route (street, dashed gray) */}
+      {localRoute?.found && localRoute.egressRoute.length > 1 && (
+        <Polyline
+          positions={localRoute.egressRoute.map((pt) => [pt.lat, pt.lng]) as [number, number][]}
+          pathOptions={{
+            color: "#9ca3af",
+            weight: 5,
+            opacity: 0.9,
+            dashArray: "8 6",
+          }}
+        >
+          <Tooltip sticky>Ieșire pe stradă</Tooltip>
+        </Polyline>
+      )}
 
       {/* Navigation mode: follow user position */}
       <NavigationFollower position={userPosition} active={navigationMode} />
 
-      {/* Fit bounds to route when not in navigation */}
-      {!navigationMode && <FitRouteBounds route={bikeRoute} />}
+      {/* Fit bounds to local route when not in navigation */}
+      {!navigationMode && <FitLocalRouteBounds route={localRoute} />}
 
       {/* User GPS position marker */}
       {userPosition && (
